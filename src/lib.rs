@@ -50,13 +50,16 @@ static KERNEL_SRC: &'static str = include_str!("./kernels/keccak256.cl");
 /// keccak-256 hash of the bytecode that is provided by the contract calling
 /// CREATE2 that will be used to initialize the new contract. An additional set
 /// of three optional values may be provided: a device to target for OpenCL GPU
-/// search, a threshold for leading zeroes to search for, and a threshold for
-/// total zeroes to search for.
+/// search, and optionally an address prefix (hex) to match at the start of
+/// deployed addresses (e.g. `1114551300` for `0x1114551300...`). When a prefix
+/// is set, leading/total zero thresholds are ignored. Without a prefix, the
+/// legacy leading-zero and total-zero thresholds apply (defaults: 3 and 5).
 pub struct Config {
     pub factory_address: [u8; 20],
     pub calling_address: [u8; 20],
     pub init_code_hash: [u8; 32],
     pub gpu_device: u8,
+    pub address_prefix: Vec<u8>,
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
 }
@@ -87,15 +90,18 @@ impl Config {
             None => String::from("255"), // indicates that CPU will be used.
         };
 
-        let leading_zeroes_threshold_string= match args.next() {
+        let fifth_arg = match args.next() {
             Some(arg) => arg,
-            None => String::from("3"),
+            None => String::new(),
         };
 
-        let total_zeroes_threshold_string = match args.next() {
+        let sixth_arg = match args.next() {
             Some(arg) => arg,
-            None => String::from("5"),
+            None => String::new(),
         };
+
+        let (address_prefix, leading_zeroes_threshold_string, total_zeroes_threshold_string) =
+            parse_search_criteria(&fifth_arg, &sixth_arg)?;
 
         // strip 0x from args if applicable
         if factory_address_string.starts_with("0x") {
@@ -197,6 +203,10 @@ impl Config {
             return Err("invalid value for total zeroes threshold argument. (valid: 0 .. 20, 255)")
         }
 
+        if !address_prefix.is_empty() && address_prefix.len() > 20 {
+            return Err("address prefix must be at most 20 bytes (40 hex characters).")
+        }
+
         // return the config object
         Ok(
           Self {
@@ -204,11 +214,74 @@ impl Config {
             calling_address,
             init_code_hash,
             gpu_device,
+            address_prefix,
             leading_zeroes_threshold,
             total_zeroes_threshold
           }
         )
     }
+}
+
+/// Parse the optional fifth–seventh CLI arguments into either an address prefix
+/// or legacy zero-byte thresholds.
+fn parse_search_criteria(
+    fifth: &str,
+    sixth: &str,
+) -> Result<(Vec<u8>, String, String), &'static str> {
+    if fifth.is_empty() {
+        return Ok((Vec::new(), String::from("3"), String::from("5")));
+    }
+
+    if looks_like_address_prefix(fifth) {
+        let prefix = decode_address_prefix(fifth)?;
+        return Ok((prefix, String::new(), String::new()));
+    }
+
+    let leading = fifth.to_string();
+    let total = if sixth.is_empty() {
+        String::from("5")
+    } else {
+        sixth.to_string()
+    };
+    Ok((Vec::new(), leading, total))
+}
+
+fn looks_like_address_prefix(s: &str) -> bool {
+    let hex = if s.starts_with("0x") || s.starts_with("0X") {
+        &s[2..]
+    } else {
+        s
+    };
+    if hex.is_empty() {
+        return false;
+    }
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    // Legacy mode uses small integers (0–20, or 255 for total-only disable).
+    if hex.len() <= 2 {
+        if let Ok(n) = u8::from_str_radix(hex, 10) {
+            return n > 20;
+        }
+        if let Ok(n) = u8::from_str_radix(hex, 16) {
+            return n > 20;
+        }
+    }
+    true
+}
+
+fn decode_address_prefix(s: &str) -> Result<Vec<u8>, &'static str> {
+    let mut hex = s.to_string();
+    if hex.starts_with("0x") || hex.starts_with("0X") {
+        hex = without_prefix(hex);
+    }
+    if hex.is_empty() {
+        return Err("address prefix cannot be empty.");
+    }
+    if hex.len() % 2 != 0 {
+        return Err("address prefix hex must have an even number of characters.");
+    }
+    Vec::from_hex(&hex).map_err(|_| "could not decode address prefix argument.")
 }
 
 /// Given a Config object with a factory address, a caller address, and a
@@ -282,36 +355,47 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
             let mut res: [u8; 32] = [0; 32];
             hash.finalize(&mut res);
 
-            // get the total zero bytes associated with the address
-            let total = res
-                          .iter()
-                          .dropping(12)
-                          .filter(|&n| *n == ZERO_BYTE)
-                          .count();
+            let mut address_bytes: [u8; 20] = Default::default();
+            address_bytes.copy_from_slice(&res[12..]);
 
-            // only proceed if there are at least three zero bytes
-            if total > 2 {
-                // get the leading zero bytes associated with the address
-                let mut leading = 0;
-
-                // iterate through each byte of address and count zero bytes
-                for (i, b) in res.iter().dropping(12).enumerate() {
-                    if b != &ZERO_BYTE {
-                        leading = i; // set leading on finding non-zero byte
-                        break;       // stop searching upon locating
+            let match_result: Option<(String, usize, usize)> =
+                if !config.address_prefix.is_empty() {
+                    if address_bytes.starts_with(&config.address_prefix) {
+                        Some((prefix_rarity(&config.address_prefix), 0, 0))
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    let total = res
+                                  .iter()
+                                  .dropping(12)
+                                  .filter(|&n| *n == ZERO_BYTE)
+                                  .count();
 
-                // look up the reward amount
-                let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
+                    if total <= 2 {
+                        None
+                    } else {
+                        let mut leading = 0;
 
-                // proceed if an efficient address has been found
-                if reward_amount != ZERO_REWARD {
-                    // truncate first 12 bytes from the hash to derive address
-                    let mut address_bytes: [u8; 20] = Default::default();
-                    address_bytes.copy_from_slice(&res[12..]);
+                        for (i, b) in res.iter().dropping(12).enumerate() {
+                            if b != &ZERO_BYTE {
+                                leading = i;
+                                break;
+                            }
+                        }
 
+                        let key = leading * 20 + total;
+                        let reward_amount = rewards.get(&key);
+
+                        if reward_amount == ZERO_REWARD {
+                            None
+                        } else {
+                            Some((reward_amount.to_string(), leading, total))
+                        }
+                    }
+                };
+
+            if let Some((reward_amount, _leading, _total)) = match_result {
                     // get the address that results from the hash
                     let address_hex_string = hex::encode(&address_bytes);
                     let address = format!("{}", &address_hex_string);
@@ -386,7 +470,6 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 
                     // release the file lock
                     file.unlock().expect("Couldn't unlock file.")
-                }
             }
         });
     }
@@ -455,9 +538,11 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let caller: [u8; 20] = config.calling_address;
     let init_hash: [u8; 32] = config.init_code_hash;
 
+    let prefix_defines = address_prefix_defines(&config.address_prefix);
+
     // generate the kernel source code with the define macros
     let kernel_src = &format!(
-        "{}\n{}\n{}\n#define LEADING_ZEROES {}\n#define TOTAL_ZEROES {}\n{}",
+        "{}\n{}\n{}\n#define LEADING_ZEROES {}\n#define TOTAL_ZEROES {}\n{}\n{}",
         factory
             .iter()
             .enumerate()
@@ -475,6 +560,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             .collect::<String>(),
         config.leading_zeroes_threshold,
         config.total_zeroes_threshold,
+        prefix_defines,
         KERNEL_SRC
     );
 
@@ -623,14 +709,23 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                   work_rate as f64 * rate,
                   &found
                 ))?;    
-                // display information about the current search criteria
+                let criteria = if !config.address_prefix.is_empty() {
+                    format!(
+                      "prefix: 0x{}",
+                      hex::encode(&config.address_prefix)
+                    )
+                } else {
+                    format!(
+                      "threshold: {} leading or {} total zeroes",
+                      config.leading_zeroes_threshold,
+                      config.total_zeroes_threshold
+                    )
+                };
                 term.write_line(&format!(
-                  "current search space: {}xxxxxxxx{:08x}\t\t\
-                  threshold: {} leading or {} total zeroes",
+                  "current search space: {}xxxxxxxx{:08x}\t\t{}",
                   hex::encode(&salt),
                   BigEndian::read_u64(&view_buf),
-                  config.leading_zeroes_threshold,
-                  config.total_zeroes_threshold
+                  criteria
                 ))?;
 
                 // display recently found solutions based on terminal height
@@ -714,28 +809,33 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 let mut res: [u8; 32] = [0; 32];
                 hash.finalize(&mut res);
 
-                // get the total zero bytes associated with the address
-                let total = res
-                              .iter()
-                              .dropping(12)
-                              .filter(|&n| *n == ZERO_BYTE)
-                              .count();
-
-                // get the leading zero bytes associated with the address
-                let mut leading = 0;
-
-                // iterate through each byte of address and count zero bytes
-                for (i, b) in res.iter().dropping(12).enumerate() {
-                    if b != &ZERO_BYTE {
-                        leading = i; // set leading on reaching non-zero byte
-                        break; // stop on locating (unless it's null address!)
-                    }
-                }
-
-                let key = leading * 20 + total;
-
                 let mut address_bytes: [u8; 20] = Default::default();
                 address_bytes.copy_from_slice(&res[12..]);
+
+                let (leading, total, reward_amount) = if !config.address_prefix.is_empty() {
+                    if !address_bytes.starts_with(&config.address_prefix) {
+                        return;
+                    }
+                    (0usize, 0usize, prefix_rarity(&config.address_prefix))
+                } else {
+                    let total = res
+                                  .iter()
+                                  .dropping(12)
+                                  .filter(|&n| *n == ZERO_BYTE)
+                                  .count();
+
+                    let mut leading = 0;
+
+                    for (i, b) in res.iter().dropping(12).enumerate() {
+                        if b != &ZERO_BYTE {
+                            leading = i;
+                            break;
+                        }
+                    }
+
+                    let key = leading * 20 + total;
+                    (leading, total, rewards.get(&key).to_string())
+                };
 
                 // get the address that results from the hash
                 let address_hex_string = hex::encode(&address_bytes);
@@ -782,8 +882,6 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                     }
                 }
 
-                let reward_amount = rewards.get(&key);
-
                 let output = format!(
                   "0x{}{}{} => {} => {}",
                   hex::encode(&caller),
@@ -808,6 +906,38 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             }
         });
     }
+}
+
+/// OpenCL `#define`s for matching a fixed address prefix at compile time.
+fn address_prefix_defines(prefix: &[u8]) -> String {
+    if prefix.is_empty() {
+        return String::from("#define PREFIX_LEN 0\n");
+    }
+
+    let mut defines = format!("#define PREFIX_LEN {}\n", prefix.len());
+    for (i, byte) in prefix.iter().enumerate() {
+        defines.push_str(&format!("#define PREFIX_{} {}u\n", i, byte));
+    }
+
+    let checks: String = (0..prefix.len())
+        .map(|i| format!("(d[{}] == PREFIX_{})", i, i))
+        .collect::<Vec<_>>()
+        .join(" && ");
+
+    defines.push_str(&format!(
+        "static inline bool hasPrefix(uchar const *d) {{ return {}; }}\n",
+        checks
+    ));
+    defines
+}
+
+/// Approximate rarity: one matching address per 16^(2 * prefix_bytes).
+fn prefix_rarity(prefix: &[u8]) -> String {
+    let mut rarity: u128 = 1;
+    for _ in prefix {
+        rarity = rarity.saturating_mul(256);
+    }
+    rarity.to_string()
 }
 
 /// Remove the `0x` prefix from a hex string.

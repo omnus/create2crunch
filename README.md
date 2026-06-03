@@ -17,6 +17,14 @@ For each efficient address found, the salt, resultant addresses, and value *(i.e
 
 This tool was originally built for use with [`Pr000xy`](https://github.com/0age/Pr000xy), including with [`Create2Factory`](https://github.com/0age/Pr000xy/blob/master/contracts/Create2Factory.sol) directly.
 
-There is also an experimental OpenCL feature that can be used to search for addresses using a GPU. To give it a try, include a fourth parameter specifying the device ID to use, and optionally a fifth and sixth parameter to filter returned results by a threshold based on leading zero bytes and total zero bytes, respectively. By way of example, to perform the same search as above, but using OpenCL device 2 and only returning results that create addresses with at least four leading zeroes or six total zeroes, use `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` (you'll also probably want to try tweaking the `WORK_SIZE` parameter in `src/lib.rs`).
+There is also an experimental OpenCL feature that can be used to search for addresses using a GPU. Include a fourth parameter specifying the device ID to use. You can then pass a **hex address prefix** as the fifth argument to search for addresses that start with that byte sequence (without the `0x` is fine). For example, to find addresses starting with `0x1114551300` using GPU device 2:
+
+```sh
+$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 1114551300
+```
+
+The prefix can be up to 20 bytes (40 hex characters). Longer prefixes are exponentially harder to find.
+
+Alternatively, omit a hex prefix and supply numeric fifth and sixth arguments to use the legacy filter (leading zero bytes and total zero bytes). Example: `$ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH 2 4 6` returns addresses with at least four leading zeroes or six total zeroes. You may also want to tweak the `WORK_SIZE` parameter in `src/lib.rs`.
 
 PRs welcome!

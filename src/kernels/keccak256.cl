@@ -352,12 +352,17 @@ __kernel void hashMessage(
   keccakf(spongeBuffer);
 
   // determine if the address meets the constraints
+#if PREFIX_LEN > 0
+  if (hasPrefix(digest))
+#else
   if (
     hasLeading(digest) 
 #if TOTAL_ZEROES <= 20
     || hasTotal(digest)
 #endif
-  ) {
+  )
+#endif
+  {
     // To be honest, if we are using OpenCL, 
     // we just need to write one solution for all practical purposes,
     // since the chance of multiple solutions appearing
