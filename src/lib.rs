@@ -175,33 +175,44 @@ impl Config {
             }
         };
 
-        let leading_zeroes_threshold = match leading_zeroes_threshold_string
-                                               .parse::<u8>() {
-            Ok(t) => t,
-            Err(_) => {
-                return Err(
-                    "invalid leading zeroes threshold value supplied."
-                )
-            }
-        };
+        let (leading_zeroes_threshold, total_zeroes_threshold) =
+            if !address_prefix.is_empty() {
+                (0u8, 255u8)
+            } else {
+                let leading_zeroes_threshold =
+                    match leading_zeroes_threshold_string.parse::<u8>() {
+                        Ok(t) => t,
+                        Err(_) => {
+                            return Err(
+                                "invalid leading zeroes threshold value supplied.",
+                            );
+                        }
+                    };
 
-        let total_zeroes_threshold = match total_zeroes_threshold_string
-                                             .parse::<u8>() {
-            Ok(t) => t,
-            Err(_) => {
-                return Err(
-                    "invalid total zeroes threshold value supplied."
-                )
-            }
-        };
+                let total_zeroes_threshold =
+                    match total_zeroes_threshold_string.parse::<u8>() {
+                        Ok(t) => t,
+                        Err(_) => {
+                            return Err(
+                                "invalid total zeroes threshold value supplied.",
+                            );
+                        }
+                    };
 
-        if leading_zeroes_threshold > 20 {
-            return Err("invalid value for leading zeroes threshold argument. (valid: 0 .. 20)")
-        }
+                if leading_zeroes_threshold > 20 {
+                    return Err(
+                        "invalid value for leading zeroes threshold argument. (valid: 0 .. 20)",
+                    );
+                }
 
-        if total_zeroes_threshold > 20 && total_zeroes_threshold != 255  {
-            return Err("invalid value for total zeroes threshold argument. (valid: 0 .. 20, 255)")
-        }
+                if total_zeroes_threshold > 20 && total_zeroes_threshold != 255 {
+                    return Err(
+                        "invalid value for total zeroes threshold argument. (valid: 0 .. 20, 255)",
+                    );
+                }
+
+                (leading_zeroes_threshold, total_zeroes_threshold)
+            };
 
         if !address_prefix.is_empty() && address_prefix.len() > 20 {
             return Err("address prefix must be at most 20 bytes (40 hex characters).")
